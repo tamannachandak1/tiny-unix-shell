@@ -10,6 +10,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <errno.h>
+#include <fcntl.h>
 
 /* Misc manifest constants */
 #define MAXLINE    1024   /* max line size */
@@ -96,22 +97,23 @@ int main(int argc, char **argv) {
     dup2(1, 2);
 
     /* Parse the command line */
-    while ((c = getopt(argc, argv, "hvp")) != EOF) {
-        switch (c) {
-        case 'h':             /* print help message */
-            usage();
-	    break;
-        case 'v':             /* emit additional diagnostic info */
-            verbose = 1;
-	    break;
-        case 'p':             /* don't print a prompt */
-            emit_prompt = 0;  /* handy for automatic testing */
-	    break;
-	default:
-    	usage();
+    if (argc > 1) {
+	    while ((c = getopt(argc, argv, "hvp")) != EOF) {
+    	    switch (c) {
+        	case 'h':             /* print help message */
+            	usage();
+	    		break;
+        	case 'v':             /* emit additional diagnostic info */
+            	verbose = 1;
+	    		break;
+        	case 'p':             /* don't print a prompt */
+            	emit_prompt = 0;  /* handy for automatic testing */
+	    		break;
+			default:
+    			usage();
+			}
+    	}
 	}
-    }
-
     /* Install the signal handlers */
 
     /* These are the ones you will need to implement */
@@ -162,6 +164,7 @@ int main(int argc, char **argv) {
 */
 void eval(char *cmdline) {
 	char *argv[MAXARGS];
+
 	int bg = parseline(cmdline, argv);
 	if (argv[0] == NULL) {
 		return;
@@ -171,44 +174,159 @@ void eval(char *cmdline) {
 		return;
 	}
 
-	sigset_t mask, prev;
-	sigemptyset(&mask);
-	sigaddset(&mask, SIGCHLD);
-
-	if (sigprocmask(SIG_BLOCK, &mask, &prev) <0) {
-		unix_error("sigprocmask rrror");
-	}
-	pid_t pid = fork();
-	if (pid < 0) {
-		unix_error("Fork Error");
-	}	 
-	else if (pid == 0) {
-		if (setpgid(0,0) < 0) {
-			unix_error("setpgid error");
+	int pipecount = 0;
+	int pipepos[MAXARGS];
+	for (int i = 0; argv[i] != NULL; i++) {
+		if (strcmp(argv[i], "|") == 0) {
+			pipepos[pipecount++] = i;
 		}
-		if (sigprocmask(SIG_SETMASK, &prev, NULL) < 0) {
-		    unix_error("sigprocmask error");
+	}
+
+	if (pipecount == 0) {
+		sigset_t mask, prev;
+		sigemptyset(&mask);
+		sigaddset(&mask, SIGCHLD);
+		
+		if (sigprocmask(SIG_BLOCK, &mask, &prev) <0) {
+				unix_error("sigprocmask error");
 		}
-		execve(argv[0], argv, environ);
-		printf("%s: Command was not found\n", argv[0]);
-		exit(1);
-	}
+		pid_t pid = fork();
+		if (pid < 0) {
+			unix_error("Fork Error");
+		}	 
+		else if (pid == 0) {
+			if (setpgid(0,0) < 0) {
+				unix_error("setpgid error");
+			}
+			if (sigprocmask(SIG_SETMASK, &prev, NULL) < 0) {
+			    unix_error("sigprocmask error");
+			}
 
-	addjob(jobs, pid, bg ? BG : FG, cmdline);
-	if (sigprocmask(SIG_SETMASK, &prev, NULL) < 0) { 
-		unix_error("sigprocmask error");
-	}
+			int i = 0;
+			while (argv[i] != NULL) {
+				if (strcmp(argv[i], "<") == 0 && argv[i+1] != NULL) {
+					int fd = open(argv[i+1], O_RDONLY);
+					if (fd < 0){
+						printf("Error opening input file: %s\n", argv[i+1]);
+						exit(1);
+					}
+					close(0);
+					dup(fd);
+					close(fd);
+					argv[i] = NULL;
+				}
+				else if (strcmp(argv[i], ">") == 0 && argv[i+1] != NULL) {
+					int fd = open(argv[i+1], O_WRONLY|O_CREAT|O_TRUNC, S_IRWXU|S_IRWXG|S_IRWXO);
+					if (fd < 0) {
+						printf("Error opening output file: %s\n", argv[i+1]);
+						exit(1);
+					}
+					close(1);
+					dup(fd);
+					close(fd);
+					argv[i] = NULL;
+				}
+				else if (strcmp(argv[i], ">>") == 0 && argv[i+1] != NULL) {
+					int fd = open(argv[i+1], O_WRONLY|O_CREAT|O_APPEND, S_IRWXU|S_IRWXG|S_IRWXO);
+						if (fd < 0) {
+							printf("Error opening output file: %s\n", argv[i+1]);
+							exit(1);
+						}
+					close(1);
+					dup(fd);
+					close(fd);
+					argv[i] = NULL;
+				}
+				else if (strcmp(argv[i], "2>") == 0 && argv[i+1] != NULL) {
+					int fd = open(argv[i+1], O_WRONLY|O_CREAT|O_TRUNC, S_IRWXU|S_IRWXG|S_IRWXO);
+					if (fd < 0) {
+						printf("Error opening output file: %s\n", argv[i+1]);
+						exit(1);
+					}
+					close(2);
+					dup(fd);
+					close(fd);
+					argv[i] = NULL;
+				}
+				i++;
+			}
+			execve(argv[0], argv, environ);
+			printf("%s: Command was not found\n", argv[0]);
+			exit(1);		
+		}
+		addjob(jobs, pid, bg ? BG : FG, cmdline);
+		if (sigprocmask(SIG_SETMASK, &prev, NULL) < 0) { 
+			unix_error("sigprocmask error");
+		}
 
-	if (!bg) {
-		waitfg(pid);
+		if (!bg) {
+			waitfg(pid);
+		}
+		else {
+			struct job_t *job = getjobpid(jobs, pid);
+			if (job) {
+				printf("[%d] (%d) %s", job->jid, job->pid, job->cmdline);
+			}
+		}
 	}
 	else {
-		struct job_t *job = getjobpid(jobs, pid);
-		if (job) {
-			printf("[%d] (%d) %s", job->jid, job->pid, job->cmdline);
+		int numcommands = pipecount + 1;
+		int pipes[pipecount][2];
+		pid_t pids[numcommands];
+
+		for (int i = 0; i < pipecount; i++) {
+			if (pipe(pipes[i]) < 0) {
+				unix_error("pipe error");
+			}
+		}
+
+		int cmdstart = 0;
+		for (int cmd_index = 0; cmd_index < numcommands; cmd_index++) {
+			char *cmd_argv[MAXARGS];
+			int arg_index = 0;
+
+			int cmd_end = (cmd_index < pipecount) ? pipepos[cmd_index] : MAXARGS;
+			for (int i = cmdstart; argv[i] != NULL && i < cmd_end; i++) {
+				cmd_argv[arg_index++] = argv[i];
+			}
+			cmd_argv[arg_index] = NULL;
+
+			pids[cmd_index] = fork();
+			if (pids[cmd_index] < 0) {
+				unix_error("fork error");
+			}
+			else if (pids[cmd_index] == 0) {
+				if (setpgid(0, 0) < 0) {
+					unix_error("setpgid error");
+				}
+				if (cmd_index > 0) {
+					dup2(pipes[cmd_index-1][0], STDIN_FILENO);
+				}
+				if (cmd_index < numcommands - 1) {
+					dup2(pipes[cmd_index][1], STDOUT_FILENO);
+				}
+				for (int k = 0; k < pipecount; k++) {
+					close(pipes[k][0]);
+					close(pipes[k][1]);
+				}
+				execve(cmd_argv[0], cmd_argv, environ);
+				printf("%s: Command was not found\n", cmd_argv[0]);
+				exit(1);
+			}
+			cmdstart = cmd_end + 1;
+		}
+
+		for (int i = 0; i < pipecount; i++) {
+			close(pipes[i][0]);
+			close(pipes[i][1]);
+		}
+		for (int i = 0; i < numcommands; i++) {
+			waitpid(pids[i], NULL, 0);
 		}
 	}
 }
+
+
 
 /* 
  * parseline - Parse the command line and build the argv array.
@@ -628,3 +746,6 @@ void sigquit_handler(int sig)
     printf("Terminating after receipt of SIGQUIT signal\n");
     exit(1);
 }
+
+
+
